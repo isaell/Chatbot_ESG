@@ -1,0 +1,11 @@
+Metadata-Version: 2.1
+Name: weaviate
+Version: 0.1.2
+Summary: A placeholder package for the Weaviate name
+Author: Weaviate
+Author-email: hello@weaviate.io,
+License: BSD 3-clause
+Description-Content-Type: text/x-rst; charset=UTF-8
+License-File: LICENSE
+
+A placeholder package for the Weaviate name
