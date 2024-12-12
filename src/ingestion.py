@@ -1,6 +1,9 @@
 #!/usr/bin/python3
 
 import utils
+from Qdrant_handler import QdrantHandler
+from MongoDB_handler import MongoDBHandler
+
 import os
 import json 
 import io
@@ -13,7 +16,6 @@ from google_auth_oauthlib.flow import InstalledAppFlow  # For handling new OAuth
 from googleapiclient.discovery import build             # To interact with Google APIs
 from googleapiclient.http import MediaIoBaseDownload    # To download data from google drive
 
-
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from transformers import AutoModel, AutoTokenizer #, AutoModelForSequenceClassification, pipeline
 
@@ -23,7 +25,6 @@ utils.setup_logging(log_level='WARNING')  #DEBUG
 
 
 class GoogleDriveService:
-
     def __init__(self):
         """
         Initialize Google Drive service with optional credentials path
@@ -36,7 +37,6 @@ class GoogleDriveService:
         created automatically when the authorization flow completes for the first time.
         Currently, the token is created to authenticate both scopes.
         """
-
         # If modifying these scopes, delete the file token.json
         SCOPES = [
             'https://www.googleapis.com/auth/drive.readonly',
@@ -127,9 +127,7 @@ class GoogleDriveService:
 
 
 class ParseChunkEmbed:
-    
     def __init__(self):
-
         # ESG-BERT model
         self.tokenizer = AutoTokenizer.from_pretrained('nbroad/ESG-BERT')
         self.model = AutoModel.from_pretrained('nbroad/ESG-BERT')
@@ -160,7 +158,7 @@ class ParseChunkEmbed:
         return splitter.split_text(text)
 
 
-    def create_embedding(self, text):
+    def compute_embeddings(self, text):
         """
         creates embeddings using the pretrained tokenizer from ESG-BERT,
         transform text into vector representations that capture semantic meaning.
@@ -208,22 +206,40 @@ def get_gdrive_data(folder_id):
             gdrive_service.download_files(file['id'], file['name'])
 
 
-def process_reports(db_name, collection_name):
-    """
-    Processes reports (parsing pdfs, chunking text, creating and inserting embeddings) 
-    after having pdfs in a local directory. 
 
-    For flexible use, this could be expanded to processing other input file types and
-    getting data from other data sources than google drive.
-
-    Input: database name and collection name on Mongo DB
+###
+def process_reports(database, **kwargs):
     """
+    Processes reports using specified database handler.
+    
+    :param database: Type of database handler to use
+    :param kwargs: Database-specific parameters
+    """
+    # Database handler selection with parameter validation
+    if database == 'MongoDB':
+        required_keys = ['db_name', 'collection_name']
+        if not all(key in kwargs for key in required_keys):
+            raise ValueError(f"MongoDB requires: {required_keys}")
+        db_handler = MongoDBHandler(
+            db_name = kwargs.get('db_name'),
+            collection_name = kwargs.get('collection_name')
+        )
+    
+    elif database == 'Qdrant':
+        required_keys = ['collection_name']
+        if not all(key in kwargs for key in required_keys):
+            raise ValueError(f"Qdrant requires: {required_keys}")
+        db_handler = QdrantHandler(
+            collection_name = kwargs.get('collection_name')
+        )
+    
+    else:
+        raise ValueError(f"Unsupported database type: {database}")
+
     ingester = ParseChunkEmbed()
+    pdf_directory = "downloads"  
 
-    # Automatically handles connection and closure
-    with utils.MongoDBHandler(db_name, collection_name) as db:
-        pdf_directory = "downloads"  
-
+    with db_handler as db:
         for filename in os.listdir(pdf_directory):
             if filename.endswith('.pdf'):
                 pdf_path = os.path.join(pdf_directory, filename)
@@ -236,16 +252,22 @@ def process_reports(db_name, collection_name):
                     
                 # Create and store embeddings
                 for chunk in chunks:
-                    embedding = ingester.create_embedding(chunk)
+                    embedding = ingester.compute_embeddings(chunk)
+                    #print(f"Embedding vector size: {len(embedding)}")
 
-                    # Imserts embeddings 
+                    # Inserts embeddings 
                     db.insert_embedding(filename, chunk, embedding)
 
+                    
 
-
-# EXECUTE
+### STEP 1
+# assemble data, here: pdfs are being taken from google drive
 # folder ID is for the folder where data is stored on google drive, here: 'annual_reports_2024'
 get_gdrive_data(folder_id = '1ud75JBvZ1JDnhkMqGy7GVOSw1mva0_ev')
-# insert database name and collection name (currently on mongo db) 
-process_reports(db_name = 'esg_reports', collection_name = 'document_embeddings')
+
+### STEP 2
+# processing step for parsing pdfs, chunking and creating embeddings in a vector database of your choice
+# OBS: Depending on which database you want to use either 1 or 2 params are needed
+#process_reports(db_name = 'annual_reports',collection_name = 'document_embeddings', database='MongoDB') 
+process_reports(collection_name='ESG_embeddings', database='Qdrant')
                                     
