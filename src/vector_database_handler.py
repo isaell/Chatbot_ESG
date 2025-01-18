@@ -1,19 +1,44 @@
 from abc import ABC, abstractmethod
+import torch
+from typing import List, Dict, Any
 import numpy as np
 
 class VectorDatabaseHandler(ABC):
+    """
+    designed to serve as an abstract base class for handling vector database operations,
+    i.e. to define a blueprint for other classes to implement.
+    """
     @abstractmethod
-    def connect(self):
+    def connect(self) -> 'VectorDatabaseHandler':
         """Establish database connection"""
         pass
 
     @abstractmethod
-    def insert_embedding(self, document_id: str, text_chunk: str, embedding: np.ndarray):
-        """Insert embedding into the database"""
+    def insert_embedding(self,
+        document_id: str,
+        text_chunk: str,
+        embedding: np.ndarray):
+        """Insert embeddings into the database"""
         pass
 
     @abstractmethod
-    def close_connection(self):
+    def insert_embeddings_batch(self,
+        filename: str,
+        chunks: List[Dict[str, Any]],
+        embeddings: torch.Tensor
+    ) -> None:
+        """
+        Insert batch of embeddings into database.
+
+        Args:
+            filename: Source document name
+            chunks: List of dictionaries containing text and metadata
+            embeddings: Tensor of embeddings
+        """
+        pass
+
+    @abstractmethod
+    def close_connection(self) -> None:
         """Close database connection"""
         pass
 
@@ -21,6 +46,25 @@ class VectorDatabaseHandler(ABC):
         """Support context manager protocol"""
         return self.connect()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb): # keep exit type etc in here
         """Close connection when exiting context"""
         self.close_connection()
+
+
+class VectorRetriever(ABC):
+    @abstractmethod
+    def search(self,
+        query: str,
+        top_k: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for similar documents using vector similarity.
+
+        Args:
+            query: Search query
+            top_k: Number of results to return
+
+        Returns:
+            List of documents with text and metadata
+        """
+        pass
