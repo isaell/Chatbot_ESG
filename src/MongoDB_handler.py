@@ -1,6 +1,5 @@
 import torch
 import logging
-import numpy as np
 from typing import List, Dict, Any, Optional
 from pymongo import MongoClient
 from pymongo.database import Database
@@ -14,11 +13,7 @@ from vector_database_handler import VectorDatabaseHandler, VectorRetriever
 
 class MongoDBHandler(VectorDatabaseHandler):
     """
-    Initialize MongoDB connection parameters.
-
-    :param db_name: Name of the database to connect to
-    :param collection_name: Name of the collection to use
-    :param uri: Optional MongoDB connection URI (overrides environment variable)
+    Initialize MongoDB connection parameters
     """
 
     def __init__(self,
@@ -45,30 +40,22 @@ class MongoDBHandler(VectorDatabaseHandler):
             self.db = self.client[self.db_name]
             self.collection = self.db[self.collection_name]
 
-            print(f'Connected to MongoDB database: {self.db_name}')
+            # Ensure vector search index exists
+            #Need to initialize first, or run:
+            try:
+                self.collection.create_index([
+                    ("embedding", "vector", {"numDimensions": 768, "similarity": "cosine"})
+                ])
+                self.logger.info("Vector search index created")
+            except:
+                pass
+
+            self.logger.info(f'Connected to MongoDB database: {self.db_name}')
             return self
 
         except Exception as e:
             self.logger.error(f'Failed to connect to MongoDB: {str(e)}')
             raise
-
-    def insert_embedding(self,
-            document_id: str,
-            text_chunk: str,
-            embedding: np.ndarray):
-            """
-            Insert embeddings into MongoDB.
-
-            Args:
-                document_id (str):
-                text_chunk (str):
-                embeddings (array):
-            """
-            self.collection.insert_one({
-                'document_id': document_id,
-                'text_chunk': text_chunk,
-                'embedding': embedding.tolist()
-            })
 
 
     def insert_embeddings_batch(
@@ -89,18 +76,15 @@ class MongoDBHandler(VectorDatabaseHandler):
             if isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.cpu().numpy()
 
-                try:
-                    #Note that Atlas vector search is used. Need to initialize first, or run:
-                    self.collection.create_index([('embedding', 'vector')])
-                except:
-                    pass
-
             documents = [
                 {
                     'filename': filename,
                     'chunk_id': i,
                     'text': chunk['text'],
-                    'metadata': chunk.get('metadata', {}),
+                    'metadata': {
+                        **chunk.get('metadata', {}),
+                        'page_number': chunk.get('metadata', {}).get('page_number', 0)
+                    },
                     'embedding': embedding.tolist()
                 }
                 for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
@@ -118,14 +102,16 @@ class MongoDBHandler(VectorDatabaseHandler):
     def close_connection(self) -> None:
         if self.client:
             self.client.close()
-            print("MongoDB connection closed")
+            self.logger.info("MongoDB connection closed")
             self.client = None
 
 
 class MongoDBRetriever(VectorRetriever):
     def __init__(self,
         collection,
-        model_name: str = 'nbroad/ESG-BERT'):
+        #model_name: str = 'sentence-transformers/all-mpnet-base-v2'
+        model_name: str = 'nithinreddyy/finetuned-esg'
+        ):
 
         from ingestion import ParseChunkEmbed
         self.embedder = ParseChunkEmbed() # Create instance here
@@ -134,15 +120,15 @@ class MongoDBRetriever(VectorRetriever):
 
     def search(self,
         query: str,
+        filename: str = None,
         top_k: int = 3
     ) -> List[Dict[str, Any]]:
-
         try:
             # Generate query embedding
             query_embedding = self.embedder.compute_embeddings([query])[0].tolist()
 
-            # MongoDB vector search
-            results = self.collection.aggregate([
+            # Build the aggregation pipeline
+            pipeline = [
                 {
                     "$vectorSearch": {
                         "queryVector": query_embedding,
@@ -152,28 +138,33 @@ class MongoDBRetriever(VectorRetriever):
                         "index": "vector_index",
                     }
                 }
-            ])
+            ]
+
+            # Add filename filter if specified
+            if filename:
+                pipeline.append({
+                    "$match": {"filename": filename}
+                })
+
+            # MongoDB vector search
+            results = self.collection.aggregate(pipeline)
+            results_list = list(results)
+
+            self.logger.info(f"Found {len(results_list)} results for query: {query}")
+            if filename:
+                self.logger.info(f"Filtered by filename: {filename}")
 
             return [
                 {
                     'text': doc['text'],
                     'filename': doc['filename'],
                     'metadata': doc.get('metadata', {}),
+                    'page_number': doc.get('metadata', {}).get('page_number', 0),
                     'score': doc.get('score', 0.0)
                 }
-                for doc in results
+                for doc in results_list
             ]
 
         except Exception as e:
             self.logger.error(f"Error during search: {str(e)}")
             return []
-
-
-    # def retrieve_data(self, query: str, top_k: int = 5):
-    #     self.connect()  # Re-establish connection
-    #     try:
-    #         # Perform your retrieval logic here
-    #         results = self.search(query, top_k)
-    #         return results
-    #     finally:
-    #         self.close_connection()  # Ensure the connection is closed afterward

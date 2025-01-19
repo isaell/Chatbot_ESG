@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
-import torch
 from typing import List, Dict, Any
-import numpy as np
+import torch
 
 class VectorDatabaseHandler(ABC):
     """
@@ -11,14 +10,6 @@ class VectorDatabaseHandler(ABC):
     @abstractmethod
     def connect(self) -> 'VectorDatabaseHandler':
         """Establish database connection"""
-        pass
-
-    @abstractmethod
-    def insert_embedding(self,
-        document_id: str,
-        text_chunk: str,
-        embedding: np.ndarray):
-        """Insert embeddings into the database"""
         pass
 
     @abstractmethod
@@ -46,7 +37,7 @@ class VectorDatabaseHandler(ABC):
         """Support context manager protocol"""
         return self.connect()
 
-    def __exit__(self, exc_type, exc_val, exc_tb): # keep exit type etc in here
+    def __exit__(self, exc_type, exc_val, exc_tb):
         """Close connection when exiting context"""
         self.close_connection()
 

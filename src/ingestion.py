@@ -1,14 +1,19 @@
-
 import os
 import json
 import io
 import logging
-import pymupdf4llm
 import torch
-from tqdm import tqdm
-from typing import List, Dict
-from transformers import AutoModel, AutoTokenizer
-from langchain.text_splitter import MarkdownTextSplitter # RecursiveCharacterTextSplitter
+import fitz
+from typing import List, Dict, Any
+from langchain.text_splitter import MarkdownTextSplitter
+from PIL import Image
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r'/opt/homebrew/bin/tesseract'
+from sentence_transformers import SentenceTransformer
+# https://github.com/huggingface/transformers/issues/5486
+# https://stackoverflow.com/questions/62691279/how-to-disable-tokenizers-parallelism-true-false-warning/72926996#72926996
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 from google.oauth2.credentials import Credentials       # To collect credentials
 from google.auth.transport.requests import Request      # For refreshing credentials
@@ -34,6 +39,8 @@ class GoogleDriveService:
         created automatically when the authorization flow completes for the first time.
         Currently, the token is created to authenticate both scopes.
         """
+        self.logger = logging.getLogger(__name__)
+
         # If modifying these scopes, delete the file token.json
         SCOPES = [
             'https://www.googleapis.com/auth/drive.readonly',
@@ -54,13 +61,13 @@ class GoogleDriveService:
                     try:
                         creds.refresh(Request())
                     except Exception as e:
-                        print(f"Token refresh failed: {e}")
+                        self.logger.info(f"Token refresh failed: {e}")
                         creds = None  # Reset creds to trigger new flow
                         if os.path.exists('token.json'):
                             os.remove('token.json')
 
             except Exception as e:
-                print(f"Error loading credentials: {e}")
+                self.logger.info(f"Error loading credentials: {e}")
                 creds = None
                 if os.path.exists('token.json'):
                     os.remove('token.json')
@@ -76,9 +83,9 @@ class GoogleDriveService:
         with open('token.json', 'w') as token:
             token.write(creds.to_json())
 
-        print('Google Drive service established')
         # Return Google Drive API service
         self.service = build('drive', 'v3', credentials=creds)
+        self.logger.info('Google Drive service established')
 
 
     def get_metadata(self, query: str = None) -> list:
@@ -127,26 +134,25 @@ class GoogleDriveService:
             # show progress
             while not done:
                 status, done = downloader.next_chunk()
-                print(f"Downloaded {int(status.progress() * 100)}% of {file_name}.")
+                self.logger.info(f"Downloaded {int(status.progress() * 100)}% of {file_name}.")
 
             # indicate where file is downloaded to
-            print(f"File downloaded to: {file_path}")
+            self.logger.info(f"File downloaded to: {file_path}")
 
         except Exception as e:
             raise RuntimeError(f"Error downloading files: {e}")
 
 
-
 class ParseChunkEmbed:
     def __init__(
             self,
-            chunk_size: int = 512,
-            chunk_overlap: int = 50,
-            model_name: str = 'nbroad/ESG-BERT',
-            batch_size: int = 16
+            chunk_size: int = 1024,
+            chunk_overlap: int = 128,
+            model_name: str = "nithinreddyy/finetuned-esg", # general model alternative: 'sentence-transformers/all-mpnet-base-v2'
+            batch_size: int = 32
             ):
         """
-        Initialize with ESG-BERT model and processing parameters
+        Initialize with sentence-transformers model and processing parameters
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -155,10 +161,9 @@ class ParseChunkEmbed:
         # Get logger for this class
         self.logger = logging.getLogger(__name__)
 
-        # initialize ESG-BERT model and tokenizer
-        self.logger.info(f'Loading {model_name} model and tokenizer...')
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+        # initialize sentence transformer
+        self.logger.info(f'Loading {model_name} model...')
+        self.model = SentenceTransformer(model_name)
 
         # Setup device for my M1 Pro
         self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -168,135 +173,170 @@ class ParseChunkEmbed:
         self.logger.info(f"Initializing model {model_name} on {self.device}")
 
 
-    def parse_pdfs(self, pdf_path: str, pdf_directory: str) -> str:
-        """
-        Parse PDF to markdown format with image handling
-
-        Args:
-            pdf_path: Path to the PDF file
-            pdf_directory: Directory to save extracted images
-
-        Returns:
-            str: Markdown formatted text
-        """
+    def parse_pdfs(self, pdf_path: str, pdf_directory: str) -> List[Dict]:
+        """Parse PDF with enhanced table and image extraction"""
         try:
-            # Extract text in Markdown format
-            md_text = pymupdf4llm.to_markdown(pdf_path, write_images=True, image_path=pdf_directory)
+            # Use PyMuPDF (fitz) for basic text and structure
+            doc = fitz.open(pdf_path)
+            text_blocks = []
 
-            if not md_text:
-                self.logger.warning(f"No text extracted from {pdf_path}")
-                return ""
+            for page_num in range(len(doc)):
+                page = doc[page_num]
 
-            return md_text
+                # Get basic text
+                text = page.get_text()
+
+                # Extract tables using built-in table detection
+                tables = page.find_tables()
+                tables_text = []
+                for table in tables:
+                    table_md = table.to_markdown()
+                    tables_text.append(table_md)
+
+                # Get image text using Tesseract OCR
+                images = page.get_images(full=True)
+                image_texts = []
+                for img_index, img in enumerate(images):
+                    try:
+                        xref = img[0]
+                        pix = fitz.Pixmap(doc, xref)
+
+                        # Convert CMYK to RGB if necessary
+                        if pix.n - pix.alpha >= 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+
+                        # Save image temporarily
+                        img_path = f"{pdf_directory}/temp_img_{page_num}_{img_index}.png"
+                        pix.save(img_path)
+
+                        # Use Tesseract OCR
+                        try:
+                            # Open image with PIL
+                            image = Image.open(img_path)
+                            # Extract text using Tesseract
+                            img_text = pytesseract.image_to_string(image)
+                            if img_text.strip():
+                                image_texts.append(f"[Image Content: {img_text.strip()}]")
+                        except Exception as ocr_error:
+                            self.logger.warning(f"OCR failed for image on page {page_num + 1}: {ocr_error}")
+
+                        # Clean up
+                        os.remove(img_path)
+                        pix = None
+
+                    except Exception as e:
+                        self.logger.warning(f"Failed to process image on page {page_num + 1}: {e}")
+
+                # Combine all content
+                combined_text = text
+                if tables_text:
+                    combined_text += "\n\n[Tables]\n" + "\n".join(tables_text)
+                if image_texts:
+                    combined_text += "\n\n[Images]\n" + "\n".join(image_texts)
+
+                if combined_text.strip():
+                    text_blocks.append({
+                        'text': combined_text,
+                        'page_number': page_num + 1,
+                        'has_tables': bool(tables_text),
+                        'has_images': bool(image_texts)
+                    })
+
+            doc.close()
+            return text_blocks
 
         except Exception as e:
-            print(f"Error parsing PDF {pdf_path}: {str(e)}", exc_info=True)
-            return ""
+            self.logger.error(f"Error parsing PDF {pdf_path}: {str(e)}", exc_info=True)
+            return []
 
 
-    def chunk_text(self, md_text: str) -> List[Dict[str, str]]:
-        """
-        chunks input markdown text into smaller pieces while preserving markdown structure
-
-        Args:
-            md_text: Markdown formatted text
-
-        Returns:
-            List[Dict[str, str]]: List of document chunks with metadata
-        """
-        if not md_text:
+    def chunk_text(self, text_blocks: List[Dict]) -> List[Dict[str, Any]]:
+        """Chunk text while preserving structure and metadata"""
+        if not text_blocks:
             return []
 
         try:
-            # Initialize the markdown splitter
-            splitter = MarkdownTextSplitter(
-                chunk_size = self.chunk_size,
-                chunk_overlap = self.chunk_overlap
-            )
+            processed_chunks = []
+            for block in text_blocks:
+                # Split text into sections based on content type
+                text_parts = block['text'].split('\n\n[Tables]')
+                main_text = text_parts[0]
+                tables_text = text_parts[1].split('\n\n[Images]')[0] if len(text_parts) > 1 else ""
+                images_text = text_parts[1].split('\n\n[Images]')[1] if len(text_parts) > 1 and '[Images]' in text_parts[1] else ""
 
-            # Create documents from the markdown text
-            chunks = splitter.create_documents([md_text])
+                # Process main text
+                splitter = MarkdownTextSplitter(
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
 
-            # Convert chunks to the format expected by the embedding model
-            processed_chunks = [
-                {
-                    'text': getattr(chunk, 'page_content', str(chunk)),
-                    'chunk_id': i,
-                    'metadata': getattr(chunk, 'metadata', {})
-                }
-                for i, chunk in enumerate(chunks)
-            ]
+                # Chunk main text
+                main_chunks = splitter.create_documents([main_text])
 
-            self.logger.debug(f"Created {len(processed_chunks)} chunks")
+                # Process each chunk
+                for i, chunk in enumerate(main_chunks):
+                    chunk_text = getattr(chunk, 'page_content', str(chunk))
+
+                    # Add relevant table content if it exists
+                    if tables_text and i == len(main_chunks) - 1:  # Add tables to last chunk of the page
+                        chunk_text += f"\n\n[Tables]\n{tables_text}"
+
+                    # Add relevant image content if it exists
+                    if images_text and i == 0:  # Add images to first chunk of the page
+                        chunk_text += f"\n\n[Images]\n{images_text}"
+
+                    processed_chunks.append({
+                        'text': chunk_text,
+                        'chunk_id': len(processed_chunks) + i,
+                        'metadata': {
+                            'page_number': block['page_number'],
+                            'has_tables': block['has_tables'],
+                            'has_images': block['has_images']
+                        }
+                    })
+
+            self.logger.debug(f"Created {len(processed_chunks)} chunks with preserved structure")
             return processed_chunks
 
         except Exception as e:
-            print(f"Error chunking text: {str(e)}", exc_info=True)
+            self.logger.error(f"Error chunking text: {str(e)}", exc_info=True)
             return []
 
 
     @torch.no_grad()  # disables gradient calculation, reducing memory usage and speeds up computations
     def compute_embeddings(self, texts: List[str]) -> torch.Tensor:
         """
-        creates embeddings using the pretrained tokenizer from ESG-BERT,
-        transform text into vector representations that capture semantic meaning.
-        Currently using memory optimization
+        Creates embeddings using sentence-transformers model.
 
         Args:
-            text List[str]
+            texts List[str]: List of text chunks to embed
         Returns:
-            embeddings [torch tensor]
+            torch.Tensor: Tensor containing embeddings
         """
-
-        all_embeddings = []
-
-        # Process in batches
-        n_batches = (len(texts) + self.batch_size - 1) // self.batch_size
-        #self.logger.info(f"Processing {len(texts)} texts in {n_batches} batches")
         self.logger.info(f"Computing embeddings for {len(texts)} texts")
 
-        for i in tqdm(range(0, len(texts), self.batch_size)): # desc="Computing embeddings"
-            batch_texts = texts[i:i + self.batch_size]
+        try:
+            # Process in batches and show progress
+            embeddings = self.model.encode(
+                texts,
+                batch_size=self.batch_size,
+                show_progress_bar=True,
+                convert_to_tensor=True,
+                device=self.device
+            )
 
-            try:
-                # Tokenize the input text
-                inputs = self.tokenizer(
-                    batch_texts,
-                    return_tensors='pt',  # should be in PyTorch tensor format
-                    truncation=True,
-                    padding=True,
-                    max_length=512   # common limit for BERT models
-                ).to(self.device)
+            # Move to CPU
+            embeddings = embeddings.cpu()
 
+            # Clear memory
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
-                # passes the tokenized inputs through the BERT model to obtain outputs
-                outputs = self.model(**inputs)
-                embeddings = outputs.last_hidden_state.mean(dim=1)
-                # Contains the hidden states of the last layer of the BERT model for each token in the input sequence
-                # .mean(dim=1): Computes the mean across all tokens in the sequence (dim 1), resulting in a single vector
-                # representation for the entire input text. This approach is commonly used to create sentence-level embeddings.
+            return embeddings
 
-                # Move to CPU and store
-                all_embeddings.append(embeddings.cpu())
-
-                # Clear memory
-                if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-
-                self.logger.debug(f"Processed batch {i//self.batch_size + 1}/{n_batches}")
-
-            except Exception as e:
-                self.logger.error(f"Error processing batch {i//self.batch_size + 1}: {str(e)}", exc_info=True)
-                continue
-
-        if not all_embeddings:
-            self.logger.error("No embeddings were generated")
+        except Exception as e:
+            self.logger.error(f"Error computing embeddings: {str(e)}", exc_info=True)
             return torch.tensor([])
-
-        # Combine all embeddings
-        return torch.cat(all_embeddings, dim=0)
-
-
 
 def get_gdrive_data(folder_id):
     """
