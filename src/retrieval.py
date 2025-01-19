@@ -1,4 +1,3 @@
-
 import logging
 from typing import List, Dict, Any
 from llama_index.core import Settings
@@ -23,11 +22,10 @@ class RetrievalService:
         self.database_type = database_type
         self.db_params = db_params
 
-        # Initialize embedding model (ESG-BERT)
+        # Initialize embedding model
         self.embed_model = HuggingFaceEmbedding(
-            model_name = "nbroad/ESG-BERT",
-            normalize = True  # Normalize embeddings for better similarity search
-            #model_kwargs = {"device": "cuda"},  # Use "cpu" if no GPU available
+            model_name = "nithinreddyy/finetuned-esg",  # sentence-transformers/all-mpnet-base-v2
+            normalize = True  # Normalize embeddings
         )
         Settings.embed_model = self.embed_model
 
@@ -51,46 +49,62 @@ class RetrievalService:
             raise ValueError(f"Unsupported database type: {self.database_type}")
 
 
-    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def search(self, query: str, filename: str = None, top_k: int = 3) -> List[Dict[str, Any]]:
         """
         Search for documents matching the query.
 
         Args:
             query: Search query string
+            filename: Optional filename to filter results
             top_k: Number of results to return
 
         Returns:
             List of matching documents with text, page number, and certainty
         """
         try:
-            results = self.retriever.search(query, top_k=top_k)
+            results = self.retriever.search(query, filename=filename, top_k=top_k)
             return results
         except Exception as e:
             self.logger.error(f"Search failed: {str(e)}")
             return []
 
     def handle_user_query(self):
-        """Interactive function to handle user queries"""
+        """Interactive CLI for querying documents"""
+        print("\nESG Document Query Interface")
+        print("Enter your questions about ESG topics or type 'quit' to exit")
+        print("To search in a specific file, use: @filename your question")
+
         try:
             while True:
-                query = input("\nEnter your query (or 'quit' to exit): ")
-                if query.lower() == 'quit':
+                query = input("\nQuery> ").strip()
+                if query.lower() in ('quit', 'exit', 'q'):
                     break
 
-                results = self.search(query)
+                if not query:
+                    continue
 
-                print(f"\nTop {len(results)} results for query: '{query}'")
+                # Check for optional filename as input
+                filename = None
+                if query.startswith('@'):
+                    parts = query.split(' ', 1)
+                    if len(parts) > 1:
+                        filename = parts[0][1:]  # Remove @ symbol
+                        query = parts[1]
+
+                results = self.search(query, filename=filename)
+
+                if not results:
+                    print("No relevant results found.")
+                    continue
+
+                print("\nRelevant passages found:")
                 for i, result in enumerate(results, 1):
-                    print(f"\nResult {i}:")
-                    print(f"Page: {result.get('page_number', 'N/A')}")
-                    print(f"Certainty: {result.get('certainty', result.get('score', 0)):.2f}")
-                    print(f"Text: {result['text'][:200]}...")
-
+                    print(f"\n[{i}] Score: {result.get('score', 0):.2f}")
+                    print(f"Source: {result['filename']}, Page: {result.get('page_number', 'N/A')}")
+                    print(f"Text: {result['text'].strip()}")
 
         except KeyboardInterrupt:
-            print("\nExiting search...")
-        finally:
-            self.close()
+            print("\nSearch terminated.")
 
     def close(self):
         """Close database connection"""
